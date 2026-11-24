@@ -123,12 +123,26 @@ function callRoute(route, query) {
 }
 
 let capturedRoute = null;
+let capturedDisposers = [];
 async function boot(persistence) {
 	capturedRoute = null;
+	capturedDisposers = [];
 	const mod = await loadPlugin();
+	// 模拟 cordis ctx:effect 注册的清理函数在卸载时执行
 	mod.apply({
 		sessionPersistence: persistence,
-		webServer: { register(route) { capturedRoute = route; } },
+		webServer: {
+			register(route) {
+				if (capturedRoute) throw new Error('webserver: duplicate exact route "' + route.path + '"');
+				capturedRoute = route;
+				const dispose = () => { if (capturedRoute === route) capturedRoute = null; };
+				return dispose;
+			},
+		},
+		effect(fn) {
+			const cleanup = fn();
+			if (typeof cleanup === "function") capturedDisposers.push(cleanup);
+		},
 	});
 	if (!capturedRoute) throw new Error("路由未注册");
 	// 等启动时的磁盘缓存回填(通常是 no-op)
@@ -428,6 +442,88 @@ async function caseFingerprintTruncation() {
 	delete process.env.ZCODE_USAGE_STATS_BUDGET_MS;
 }
 
+async function caseRouteDispose() {
+	console.log("\n[10] 路由在卸载时被释放(热重载不会撞 duplicate route)");
+	freshHome();
+	const dir = freshDataDir();
+
+	const s1 = {
+		id: "z1",
+		sizeBytes: 90,
+		path: touchFile(dir, "z1.jsonl.zstd", 5),
+		events: [msg(1, 1, "m", { inputTokens: 3, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, T(14, 8))],
+	};
+	const p = makePersistence([s1]);
+
+	// 第一次挂载
+	const route1 = await boot(p);
+	eq(typeof route1, "object", "第一次挂载注册了路由");
+	eq(capturedDisposers.length, 1, "注册时登记了 1 个清理函数");
+
+	// 模拟插件卸载:执行清理函数
+	capturedDisposers.forEach((fn) => fn());
+	eq(capturedRoute, null, "卸载后路由已被释放");
+
+	// 第二次挂载(热重载):不应抛 duplicate route
+	let threw = null;
+	try {
+		await boot(p);
+	} catch (e) {
+		threw = e;
+	}
+	eq(threw, null, "重新挂载不抛 duplicate route");
+	ok(capturedRoute !== null, "重新挂载后路由可用");
+
+	const res = await callRoute(capturedRoute, "");
+	eq(res.ok, true, "重新挂载后接口正常");
+	eq(res.grandTotal, 3, "重新挂载后数据正确");
+}
+
+async function caseStaleRouteHeal() {
+	console.log("\n[11] 旧版泄漏的路由会被自愈清理");
+	freshHome();
+	const dir = freshDataDir();
+
+	const s1 = {
+		id: "h1",
+		sizeBytes: 95,
+		path: touchFile(dir, "h1.jsonl.zstd", 5),
+		events: [msg(1, 1, "m", { inputTokens: 8, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, T(15, 8))],
+	};
+	const p = makePersistence([s1]);
+
+	// 模拟旧版泄漏:路由表里已有一条 /api/usage-stats,但没有 disposer 能清掉它
+	const exactTable = new Map();
+	exactTable.set("/api/usage-stats", { kind: "exact", path: "/api/usage-stats", handler: () => {} });
+	const webServer = {
+		exact: exactTable,
+		register(route) {
+			if (exactTable.has(route.path)) throw new Error(`webserver: duplicate ${route.kind} route "${route.path}"`);
+			exactTable.set(route.path, route);
+			return () => { exactTable.delete(route.path); };
+		},
+	};
+
+	const mod = await loadPlugin();
+	let route = null;
+	mod.apply({
+		sessionPersistence: p,
+		webServer: {
+			exact: exactTable,
+			register(r) { route = r; return webServer.register(r); },
+		},
+		effect(fn) { const c = fn(); if (typeof c === "function") capturedDisposers.push(c); },
+	});
+	await new Promise((r) => setTimeout(r, 20));
+
+	ok(route !== null, "自愈后路由注册成功", { hasRoute: route !== null });
+	ok(exactTable.size === 1, "路由表里只有本插件这一条", { size: exactTable.size });
+
+	const res = await callRoute(route, "");
+	eq(res.ok, true, "自愈后接口可用");
+	eq(res.grandTotal, 8, "自愈后数据正确");
+}
+
 // ---------- 运行 ----------
 function cleanup() {
 	for (const dir of sandboxDirs) {
@@ -448,6 +544,8 @@ try {
 	await caseRebuildAndDelete();
 	await caseSchemaMigration();
 	await caseFingerprintTruncation();
+	await caseRouteDispose();
+	await caseStaleRouteHeal();
 } finally {
 	cleanup();
 }
